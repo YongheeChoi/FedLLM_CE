@@ -44,6 +44,7 @@ In-Run Data Shapley (ICLR 2025) 방법론을 Federated Learning 환경에 적용
 
 ```
 fed_shapley/
+├── README.md                  # 프로젝트 설명, 환경 설정, 파일 역할, 실험 재현 가이드
 ├── main.py                    # 실험 진입점 (args 파싱 및 실험 실행)
 ├── config.py                  # argument 정의 (argparse)
 ├── data/
@@ -72,7 +73,12 @@ fed_shapley/
 └── scripts/
     ├── run_basic.sh            # 기본 실험 스크립트
     ├── run_noniid.sh           # Non-IID 실험 스크립트
-    └── run_k_sweep.sh          # K sweep 실험 스크립트
+    ├── run_k_sweep.sh          # K sweep 실험 스크립트
+    ├── run_grid_search.py      # 여러 args 조합에 대해 자동으로 실험 실행 (grid search)
+    └── grid_configs/           # grid search용 YAML 설정 파일 디렉터리
+        ├── alpha_sweep.yaml    # Dirichlet alpha sweep 설정
+        ├── k_sweep.yaml        # local_epochs(K) sweep 설정
+        └── noise_sweep.yaml    # 노이즈 클라이언트 실험 sweep 설정
 ```
 
 ---
@@ -126,6 +132,14 @@ fed_shapley/
 # -- 비교 실험 설정 --
 --run_centralized: bool  # centralized 비교 실험 수행 여부 (기본값: False)
 --run_exact_shapley: bool # exact shapley ground truth 계산 여부 (기본값: True)
+
+# -- 로깅 설정 --
+--use_wandb: bool         # WandB 로깅 사용 여부 (기본값: False)
+--wandb_project: str      # WandB 프로젝트 이름 (기본값: "fed_shapley")
+--wandb_run_name: str     # WandB run 이름 (기본값: exp_name 자동 사용)
+--wandb_entity: str       # WandB entity/team 이름 (기본값: None)
+--use_tensorboard: bool   # TensorBoard 로깅 사용 여부 (기본값: False)
+--log_every: int          # 몇 라운드마다 로깅할지 (기본값: 1)
 ```
 
 ### 2. data/partition.py (데이터 분할)
@@ -406,6 +420,294 @@ class ExperimentLogger:
 
     저장 형식: JSON 또는 CSV + 시각화 이미지
     """
+```
+
+### 14. 학습 진행 과정 및 결과 저장 — WandB / TensorBoard 활용
+
+WandB를 기본 로깅 백엔드로 사용하고, TensorBoard를 선택적 폴백으로 지원한다.
+GhostSuite의 `requirements.txt`에 `wandb==0.23.1`, `tensorboard==2.20.0`이 이미 포함되어 있으므로 추가 설치 없이 사용 가능하다.
+
+```python
+# utils/logger.py 내 WandB/TensorBoard 통합 구현 명세
+
+class ExperimentLogger:
+    def __init__(self, args):
+        # WandB 초기화
+        if args.use_wandb:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,      # 예: "fed_shapley"
+                name=args.wandb_run_name or args.exp_name,
+                entity=args.wandb_entity,
+                config=vars(args),               # 모든 하이퍼파라미터 자동 기록
+                dir=args.output_dir,
+            )
+            self.wandb = wandb
+
+        # TensorBoard 초기화
+        if args.use_tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+            self.tb_writer = SummaryWriter(log_dir=args.output_dir)
+
+    def log_round(self, round_idx: int, metrics: dict):
+        """
+        매 라운드마다 호출. metrics 딕셔너리 키 예시:
+          - "val/loss", "val/accuracy"
+          - "test/accuracy"
+          - "shapley/client_{i}_inrun_1st"
+          - "shapley/client_{i}_inrun_2nd"
+          - "shapley/client_{i}_exact"
+          - "shapley/client_{i}_cumulative"
+          - "train/round_time_sec"
+        """
+        if hasattr(self, "wandb"):
+            self.wandb.log(metrics, step=round_idx)
+        if hasattr(self, "tb_writer"):
+            for k, v in metrics.items():
+                self.tb_writer.add_scalar(k, v, global_step=round_idx)
+
+    def log_final_summary(self, summary: dict):
+        """
+        실험 종료 시 호출. summary 딕셔너리 키 예시:
+          - "final/spearman_corr"
+          - "final/rmse"
+          - "final/noisy_detection_auroc"
+          - "final/best_test_accuracy"
+          - 클라이언트 제거 실험 결과 테이블
+        """
+        if hasattr(self, "wandb"):
+            self.wandb.summary.update(summary)
+            # 클라이언트 기여도 bar chart
+            self.wandb.log({"shapley/final_bar": self.wandb.plot.bar(...)})
+        if hasattr(self, "tb_writer"):
+            self.tb_writer.add_hparams(hparam_dict=..., metric_dict=summary)
+
+    def save_to_disk(self, output_dir: str):
+        """
+        WandB/TensorBoard와 별개로 로컬에도 저장:
+        - {output_dir}/results.json    : 전체 라운드별 metrics
+        - {output_dir}/shapley.csv     : 클라이언트별 누적 기여값 테이블
+        - {output_dir}/config.json     : args 스냅샷
+        """
+
+    def finish(self):
+        if hasattr(self, "wandb"):
+            self.wandb.finish()
+        if hasattr(self, "tb_writer"):
+            self.tb_writer.close()
+```
+
+**WandB 활용 시 권장 실행 방식:**
+```bash
+# 단일 실험
+python main.py --use_wandb True --wandb_project fed_shapley \
+    --exp_name "iid_k5_c10" --num_clients 10 ...
+
+# WandB sweep (wandb agent 방식)
+wandb sweep sweep_config.yaml
+wandb agent <sweep_id>
+```
+
+**TensorBoard 활용 시:**
+```bash
+python main.py --use_tensorboard True --output_dir ./runs/exp1 ...
+tensorboard --logdir ./runs
+```
+
+---
+
+### 15. scripts/run_grid_search.py — Grid Search 자동화
+
+여러 args 조합에 대해 자동으로 실험을 실행하는 Python 스크립트.
+bash 루프 대신 Python으로 구현하여 결과 수집·요약까지 한 파일에서 처리한다.
+
+```python
+# scripts/run_grid_search.py 구현 명세
+"""
+사용 예시:
+  python scripts/run_grid_search.py --config scripts/grid_configs/alpha_sweep.yaml
+  python scripts/run_grid_search.py --config scripts/grid_configs/k_sweep.yaml --dry_run
+  python scripts/run_grid_search.py --config scripts/grid_configs/k_sweep.yaml --max_runs 5
+"""
+
+import itertools
+import subprocess
+import yaml
+import csv
+import os
+import json
+from pathlib import Path
+from datetime import datetime
+
+# YAML 설정 파일 예시 (scripts/grid_configs/alpha_sweep.yaml):
+# base_args:
+#   dataset: cifar10
+#   num_clients: 10
+#   num_rounds: 100
+#   local_epochs: 5
+#   run_exact_shapley: True
+#   use_second_order: True
+#   use_wandb: True
+#   wandb_project: fed_shapley
+# grid:
+#   partition: [dirichlet]
+#   dirichlet_alpha: [0.1, 0.5, 1.0, 5.0, 100.0]
+#   seed: [42, 123, 456]
+
+def load_grid_config(config_path: str) -> dict:
+    """YAML 설정 파일 로드."""
+
+def generate_experiments(base_args: dict, grid: dict) -> list[dict]:
+    """
+    grid의 Cartesian product를 생성하여 실험 args 리스트 반환.
+    itertools.product 사용.
+    예: grid = {a: [1,2], b: [x,y]} → [{a:1,b:x}, {a:1,b:y}, {a:2,b:x}, {a:2,b:y}]
+    """
+
+def args_to_cmd(args: dict, output_dir: str) -> list[str]:
+    """
+    args 딕셔너리를 python main.py 커맨드 리스트로 변환.
+    실험별 output_dir을 args 조합으로 자동 생성.
+    예: ./outputs/grid/alpha0.1_seed42/
+    """
+
+def run_experiment(cmd: list[str], timeout: int = None) -> dict:
+    """
+    subprocess.run으로 실험 실행.
+    완료 후 output_dir/results.json에서 최종 메트릭 읽어 반환.
+    실패 시 에러 정보 반환.
+    """
+
+def save_summary_csv(results: list[dict], output_path: str):
+    """
+    모든 실험 결과를 하나의 CSV 파일로 저장.
+    컬럼: 모든 grid args + 결과 메트릭(val_acc, spearman, rmse, auroc 등)
+    """
+
+def main():
+    """
+    CLI args: --config, --dry_run, --max_runs, --output_root, --timeout
+    1. YAML 로드 → 실험 리스트 생성
+    2. --dry_run이면 실험 커맨드만 출력하고 종료
+    3. 순차 실행 (각 실험은 독립 프로세스)
+    4. 완료 후 summary CSV 저장: {output_root}/grid_results_{timestamp}.csv
+    5. 간단한 결과 요약 출력 (best run, failed runs 등)
+    """
+```
+
+---
+
+### 16. README.md 구성 명세
+
+프로젝트 루트에 `README.md`를 작성한다. 다음 섹션을 모두 포함해야 한다:
+
+```
+# FL In-Run Data Shapley
+
+## 개요
+- 프로젝트 목적: In-Run Data Shapley (ICLR 2025)를 FL 환경에 적용하여 클라이언트 기여도 평가
+- 핵심 수식 요약 (1차, 2차 Shapley)
+- GhostSuite와의 관계 (본 프레임워크는 GhostSuite와 독립적으로 동작)
+
+## 환경 요구사항
+- Python >= 3.10
+- PyTorch >= 2.0 (CUDA 11.8+ 권장)
+- 주요 패키지: torchvision, wandb, tensorboard, scikit-learn, pyyaml, tqdm
+
+## 설치
+pip install -r requirements.txt
+
+## 프로젝트 구조
+각 파일/디렉터리의 역할을 한 줄 설명:
+  - main.py: 실험 진입점
+  - config.py: 하이퍼파라미터 정의 (전체 args 목록)
+  - data/: 데이터셋 로딩 및 FL 분할 (IID, Dirichlet Non-IID, Quantity skew)
+  - models/: ResNet-18 정의
+  - fl/: FL 학습 루프 (Server, Client, FLTrainer)
+  - shapley/: In-Run / Exact / MC Shapley 계산
+  - centralized/: Centralized 비교 실험
+  - eval/: Fidelity 평가, Client removal, Noisy client detection
+  - utils/: 로깅, 시드 고정, 시각화
+  - scripts/: 실험 자동화 (grid search, sweep)
+
+## 빠른 시작
+# 최소 실험 (클라이언트 5개, IID, CIFAR-10)
+python main.py --num_clients 5 --partition iid --num_rounds 50 \
+    --local_epochs 5 --run_exact_shapley True --exp_name quick_test
+
+## 주요 실험 재현
+각 실험 시나리오별 커맨드 (실험 1~6 요약)
+scripts/ 디렉터리의 grid search 활용 방법
+
+## 결과 해석
+- shapley.csv: 각 클라이언트의 누적 기여값. 양수 = 도움, 음수 = 해로움
+- Spearman correlation: In-Run Shapley vs Exact Shapley 순위 일치도 (1에 가까울수록 좋음)
+- AUROC: 노이즈 클라이언트 탐지 성능 (0.5 = 랜덤, 1.0 = 완벽)
+- Client removal curve: 기여값 높은 순 제거 시 정확도 하락 빨라야 함
+
+## 재현성
+- 모든 실험은 --seed로 시드 고정
+- 최소 3개 시드(42, 123, 456)로 반복 후 평균 ± 표준편차 보고 권장
+```
+
+---
+
+### 17. 전체 코드 주석 가이드라인
+
+모든 `.py` 파일에 다음 기준으로 주석과 docstring을 작성한다.
+
+```
+1. 파일 상단 모듈 docstring
+   - 파일 목적 한 줄 요약
+   - 구현하는 논문 수식 번호 (예: "Eq. (3) in In-Run Data Shapley, ICLR 2025")
+   - 주요 입출력 타입 요약
+   예시:
+   \"\"\"
+   shapley/in_run_shapley.py
+   목적: 1차 및 2차 In-Run Data Shapley 계산 (논문 Eq. 3, 5)
+   입력: client_updates (List[Tensor]), val_grad (Tensor)
+   출력: {client_id: shapley_value} 딕셔너리
+   \"\"\"
+
+2. 클래스/함수 docstring (Google style)
+   def compute_round_shapley(self, client_updates, client_ids, round_idx):
+       \"\"\"
+       한 FL 라운드의 In-Run Data Shapley 계산.
+
+       Args:
+           client_updates: 각 클라이언트의 flattened Δw_c (List[Tensor], shape [num_params])
+           client_ids: 참여 클라이언트 ID 목록 (List[int])
+           round_idx: 현재 라운드 번호 (int, 0-indexed)
+
+       Returns:
+           dict[int, float]: {client_id: shapley_value}
+
+       Note:
+           1차 항: ϕ_c^(1) = -η * <∇ℓ(w_t, z_val), Δw_c>  (논문 Eq. 3)
+           2차 항: ϕ_c^(2) = (η²/2) * Δw_c^T H Σ Δw_{c'}   (논문 Eq. 5)
+       \"\"\"
+
+3. 수식 구현부 인라인 주석
+   # ∇ℓ(w_t, D_val) — validation gradient, shape: [num_params]
+   val_grad = self.server.compute_validation_gradient()
+
+   # 1차 항: ϕ_c^(1) = -η * dot(val_grad, Δw_c)
+   first_order = {cid: -eta * torch.dot(val_grad, dw)
+                  for cid, dw in zip(client_ids, client_updates)}
+
+   # 집계된 클라이언트 업데이트 합: Σ_{c ∈ C_t} Δw_c
+   aggregated = sum(client_updates)
+
+   # H @ aggregated — Hessian-vector product (논문 Eq. 5의 H^(z_val) 항)
+   hvp = self.server.compute_validation_hessian_vector_product(aggregated)
+
+4. Type hint 필수 적용
+   - 함수 인자와 반환값에 모두 type hint 작성
+   - 복잡한 타입은 typing 모듈 활용 (List, Dict, Optional, Tuple 등)
+
+5. TODO / NOTE 주석 활용
+   # NOTE: 클라이언트 100개 이상일 때 메모리 > 4GB 가능 → 디스크 저장 권장
+   # TODO Phase 3: Dirichlet Non-IID 분할 추가 예정
 ```
 
 ---
