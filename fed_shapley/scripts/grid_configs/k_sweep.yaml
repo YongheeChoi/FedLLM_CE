@@ -1,0 +1,23 @@
+# k_sweep.yaml — Grid search over local epochs K and number of rounds.
+#
+# The K × num_rounds = total_local_epochs budget is approximately fixed.
+# This tests the communication-computation tradeoff in FL:
+# - Few rounds + many epochs → less communication, more client drift
+# - Many rounds + few epochs → more communication, less drift
+
+base_args:
+  dataset: cifar10
+  num_clients: 10
+  local_lr: 0.01
+  local_batch_size: 64
+  partition: iid
+  run_exact_shapley: true
+  use_second_order: true
+  log_every: 5
+  eval_every: 5
+  output_dir: ./outputs/grid/k_sweep
+
+grid:
+  local_epochs: [1, 2, 5, 10, 20]
+  num_rounds: [500, 250, 100, 50, 25]
+  seed: [42, 123]

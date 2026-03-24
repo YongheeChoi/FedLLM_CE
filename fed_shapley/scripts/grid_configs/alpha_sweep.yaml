@@ -1,0 +1,23 @@
+# alpha_sweep.yaml — Grid search over Dirichlet alpha (label distribution heterogeneity).
+#
+# Lower alpha → more non-IID.
+# alpha=100 ≈ IID.
+# Multiple seeds for statistical robustness.
+
+base_args:
+  dataset: cifar10
+  num_clients: 10
+  num_rounds: 100
+  local_epochs: 5
+  local_lr: 0.01
+  local_batch_size: 64
+  partition: dirichlet
+  run_exact_shapley: true
+  use_second_order: true
+  log_every: 10
+  eval_every: 10
+  output_dir: ./outputs/grid/alpha_sweep
+
+grid:
+  dirichlet_alpha: [0.1, 0.5, 1.0, 5.0, 100.0]
+  seed: [42, 123, 456]

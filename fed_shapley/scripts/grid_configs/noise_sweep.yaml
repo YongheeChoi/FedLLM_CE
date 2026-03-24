@@ -1,0 +1,27 @@
+# noise_sweep.yaml — Grid search over noisy client configurations.
+#
+# Tests Shapley's ability to detect adversarial/noisy clients under varying
+# noise severity and number of noisy participants.
+#
+# noisy_clients: list of client IDs injected with label flipping
+# noise_ratio: fraction of training samples with flipped labels (informational)
+
+base_args:
+  dataset: cifar10
+  num_clients: 10
+  num_rounds: 100
+  local_epochs: 5
+  local_lr: 0.01
+  local_batch_size: 64
+  partition: iid
+  run_exact_shapley: true
+  use_second_order: true
+  noise_type: label_flip
+  log_every: 10
+  eval_every: 10
+  output_dir: ./outputs/grid/noise_sweep
+
+grid:
+  noisy_clients: [[0, 1], [0, 1, 2, 3]]
+  noise_ratio: [0.3, 0.5, 1.0]
+  seed: [42, 123]

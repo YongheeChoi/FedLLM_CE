@@ -4,89 +4,118 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-FedLLM_CE contains **GhostSuite**, a PyTorch framework for efficient per-sample gradient information computation for data-centric ML research (data selection, reweighting, synthetic data generation). Based on the ICLR'25 Outstanding Paper Runner-up ["Data Shapley in One Training Run"](https://openreview.net/pdf?id=HD6bWcj87Y).
+FedLLM_CE is a research repository containing two main components:
 
-The core insight: per-sample gradient dot-products between validation and training samples can be computed in a **single backpropagation pass** by reusing activations and output gradients already computed during standard backprop — avoiding full gradient materialization.
+### 1. GhostSuite (Original Framework)
+A PyTorch framework for efficient per-sample gradient information computation for data-centric ML research. Based on the ICLR'25 Outstanding Paper Runner-up ["Data Shapley in One Training Run"](https://openreview.net/pdf?id=HD6bWcj87Y).
+
+### 2. FedShapley (`fed_shapley/`)
+A Federated Learning framework that applies the In-Run Data Shapley method to attribute per-client contributions in FL settings. Each FL client is treated as a "player" whose Shapley value measures their contribution to reducing global validation loss, computed via gradient dot-products during training.
+
+**Core formula:**
+```
+ϕ_c^(t) = -η · <∇ℓ(w_t, D_val), Δw_c^(t)>
+```
+
+With optional second-order Hessian correction:
+```
+ϕ_c^(t) += (η²/2) · Δw_c^(t)ᵀ H(D_val) Σ_{c'} Δw_{c'}^(t)
+```
 
 ## Installation
 
 ```bash
+# GhostSuite
 cd GhostSuite
+pip install -r requirements.txt
+
+# FedShapley
+cd fed_shapley
 pip install -r requirements.txt
 ```
 
-## Running Examples
+## Running FedShapley
 
 ```bash
-cd GhostSuite/examples
+cd fed_shapley
 
-# Minimal MLP demo (GradDotProd)
-python ghost_mlp.py
+# Basic IID experiment
+python main.py --num_clients 10 --partition iid --num_rounds 100 --dataset cifar10
 
-# Gradient projection for MLP
-python ghost_gradproj_mlp.py --mode project --proj_rank_total 64
+# Non-IID with Dirichlet
+python main.py --partition dirichlet --dirichlet_alpha 0.1 --num_rounds 100
 
-# Gradient projection for language models
-python ghost_gradproj_lm.py --proj_layers "attn.c_attn,mlp.c_fc"
+# Noisy client detection
+python main.py --noisy_clients 0 1 --noise_type label_flip --run_exact_shapley
 
-# TorchTitan LLM pretraining with GradDotProd (Llama 3 130M)
-CONFIG_FILE="./torchtitan/torchtitan/models/llama3/train_configs/llama3_130m_ghost.toml" ./torchtitan/run_train_with_ghost.sh
+# Grid search
+python scripts/run_grid_search.py --config scripts/grid_configs/alpha_sweep.yaml
 ```
 
-> **Note**: `GradDotProd_LM/` and `GradProj_LM/` examples are deprecated in v0.33. Use v0.2 if needed.
+## FedShapley Architecture
 
-## Architecture
+### Entry Point
+`fed_shapley/main.py` — Orchestrates: argument parsing, dataset loading, federated partitioning, FL training with in-run Shapley, optional exact/MC Shapley baseline, evaluation, and visualization.
+
+### Core Modules
+
+**`fl/`** — Federated Learning primitives
+- `server.py`: Global model, FedAvg aggregation, validation gradient (∇ℓ) and Hessian-vector product (Hv) computation
+- `client.py`: Local SGD training, Δw_c computation, label-flip/random-update noise injection
+- `trainer.py`: Main FL training loop coordinating server, clients, and Shapley computation
+
+**`shapley/`** — Three Shapley computation engines
+- `in_run_shapley.py`: **Primary method** — O(1) per-round via gradient dot-products, supports 1st and 2nd order terms
+- `exact_shapley.py`: Ground-truth via 2^n subset enumeration (n ≤ 10 only)
+- `mc_shapley.py`: Monte Carlo permutation sampling for n > 10
+
+**`data/`** — Dataset loading and federated partitioning
+- `datasets.py`: CIFAR-10/100, Tiny ImageNet with standard augmentation
+- `partition.py`: IID and Dirichlet non-IID partitioning with optional quantity skew
+
+**`models/`** — Model factory
+- `resnet.py`: Dataset-adapted ResNet-18 (modified conv1/maxpool for 32x32/64x64 inputs)
+
+**`eval/`** — Evaluation metrics
+- `fidelity.py`: RMSE, Pearson, Spearman correlation vs. ground truth
+- `client_removal.py`: Remove high/low/random Shapley clients and retrain
+- `noisy_client.py`: AUROC for noisy client detection
+
+**`centralized/`** — Centralized training baseline
+- `centralized_trainer.py`: Per-sample gradient attribution mapped back to clients
+
+**`utils/`** — Logging, visualization, seed management
+- `logger.py`: W&B, TensorBoard, and disk logging with auto-generated experiment tags
+- `visualize.py`: Bar charts, scatter plots, heatmaps
+- `seed.py`: Global random seed setting
+
+**`scripts/`** — Experiment runners and grid search
+- Shell scripts: `run_basic.sh`, `run_noniid.sh`, `run_k_sweep.sh`
+- `run_grid_search.py`: YAML-config-driven grid search with CSV summary output
+- `grid_configs/`: Pre-configured sweeps for alpha, local epochs, and noise
+
+### Key Design Patterns
+- All Shapley calculators share the same API: `compute_round_shapley()`, `accumulate()`, `get_cumulative()`
+- Client updates are flattened to 1D tensors (trainable params only, excluding BatchNorm running stats) for dot-product computation
+- Experiment results are saved with auto-generated tags encoding key hyperparameters (e.g., `cifar10_c10_k10_iid_r100_e5_lr0.01_s42`)
+
+## GhostSuite Architecture
 
 ### Two Core Engines
 
 **`GradDotProdEngine`** (`ghostEngines/graddotprod_engine.py`)
-- **Use when**: online, per-step gradient similarity is needed (data selection, reweighting, curriculum learning, auditing training dynamics)
-- Concatenates validation + training batches in a single forward/backward pass
-- Recovers aggregated training gradients into `.grad` for the optimizer step
-- Key implementation: `autograd_grad_sample_dotprod.py` uses `_NamedSavedTensorManager` (a scope-stack-based thread-safe tensor capture) to intercept saved tensors during backprop
+- Online, per-step gradient similarity via single forward/backward pass
+- Key implementation: `autograd_grad_sample_dotprod.py` uses `_NamedSavedTensorManager` for tensor capture
 
 **`GradProjLoRAEngine`** (`ghostEngines/gradProjection/gradproj_engine.py`)
-- **Use when**: offline, corpus-scale gradient analysis for a fixed checkpoint
-- Applies Kronecker-structured random projection $P = P_i \otimes P_o$ via a zero-impact LoRA-style side branch
-- Stores projected per-sample gradients to disk for later similarity computation
-- Preserves inner products up to Johnson-Lindenstrauss distortion
+- Offline, corpus-scale gradient analysis via Kronecker-structured random projection
+- LoRA-style side branch preserves inner products up to J-L distortion
 
-### `GhostEngineManager` — The Integration Interface
-
-`ghostEngines/engine_manager.py` is the entry point for training loop integration. It auto-selects the engine based on config and provides a method-agnostic API:
-
-```python
-from ghostEngines import GhostEngineManager
-
-ghost_engine = GhostEngineManager(config, model, optimizer, ddp_info, val_data)
-
-for iteration in range(max_steps):
-    optimizer.zero_grad(set_to_none=True)
-    ghost_engine.attach_train_batch(X_train, Y_train, iteration, batch_idx)
-    X_fwd, Y_fwd = ghost_engine.prepare_forward_input(X_train, Y_train)
-
-    with ghost_engine.saved_tensors_context():   # no-op for non-GradDotProd
-        loss = model(input_ids=X_fwd, labels=Y_fwd).loss
-        loss.backward()
-
-    ghost_engine.prepare_gradients()  # moves accumulated grads to .grad
-    optimizer.step()
-    ghost_engine.aggregate_and_log()
-    ghost_engine.clear_gradients()
-```
-
-With gradient accumulation: call `aggregate_and_log()` after each microbatch; move `prepare_gradients()` / `optimizer.step()` to the end of the accumulation window.
-
-For evaluation: use `ghost_engine.detach_for_evaluation()` / `ghost_engine.reattach_after_evaluation()`.
+### Integration Interface
+`ghostEngines/engine_manager.py` (`GhostEngineManager`) auto-selects engine based on config.
 
 ### Layer Support
-
-`supported_layers_grad_samplers_dotprod.py` implements per-sample gradient computation for: Linear, Conv2D, Embedding, LayerNorm, and attention layers.
-
-`transformers_support.py` patches Hugging Face models for compatibility (dummy bias handling, embedding fixes).
-
-`ghostEngines/gradProjection/lora_modules.py` implements the LoRA side branches used by GradProjLoRAEngine without affecting model forward pass outputs.
+`supported_layers_grad_samplers_dotprod.py`: Linear, Conv2D, Embedding, LayerNorm, attention layers.
 
 ### TorchTitan Integration
-
-`examples/torchtitan/` integrates GhostSuite with PyTorch's TorchTitan training stack for large-scale LLM pretraining. Config via `.toml` files (see `llama3_130m_ghost.toml` for the ghost-specific `[ghost]` section).
+`examples/torchtitan/` for large-scale LLM pretraining with GhostSuite.
