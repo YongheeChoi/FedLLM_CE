@@ -1,1 +1,23 @@
 GhostSuite
+
+# Data files (large datasets)
+fed_shapley/data/cifar-10-batches-py/
+fed_shapley/data/cifar-10-python.tar.gz
+fed_shapley/data_cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Experiment outputs & results
+fed_shapley/outputs/
+results/
+
+# Common ML/Python ignores
+*.pt
+*.pth
+*.ckpt
+*.h5
+wandb/
+*.log
