@@ -1,5 +1,3 @@
-GhostSuite
-
 # Data files (large datasets)
 fed_shapley/data/cifar-10-batches-py/
 fed_shapley/data/cifar-10-python.tar.gz

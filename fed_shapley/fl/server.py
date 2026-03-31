@@ -77,10 +77,15 @@ class Server:
         assert abs(sum(client_weights) - 1.0) < 1e-5, \
             f"Weights must sum to 1, got {sum(client_weights):.6f}"
 
+        trainable_names = set(self.get_trainable_param_names())
         global_state = self.global_model.state_dict()
 
         with torch.no_grad():
             for name, param in global_state.items():
+                # Skip BN running stats — only aggregate trainable parameters
+                if name not in trainable_names:
+                    continue
+
                 # Accumulate weighted Δw sum
                 weighted_delta = torch.zeros_like(param, dtype=torch.float32)
                 for update, w in zip(client_updates, client_weights):
@@ -116,6 +121,12 @@ class Server:
         """
         return [n for n, p in self.global_model.named_parameters() if p.requires_grad]
 
+    def _freeze_bn(self) -> None:
+        """Set all BatchNorm layers to eval mode to prevent running stats updates."""
+        for module in self.global_model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                module.eval()
+
     def compute_validation_gradient(self) -> torch.Tensor:
         """Compute the flattened validation gradient ∇ℓ(w_t, D_val).
 
@@ -130,8 +141,11 @@ class Server:
             - Only parameters with requires_grad=True are included.
             - BatchNorm running stats are excluded (consistent with
               flatten_update_for_shapley).
+            - BatchNorm layers are kept in eval mode to prevent running stats
+              corruption during Shapley computation.
         """
         self.global_model.train()
+        self._freeze_bn()
         self.global_model.zero_grad()
 
         total_loss = torch.tensor(0.0, device=self.device)
@@ -185,6 +199,7 @@ class Server:
         params = [p for p in self.global_model.parameters() if p.requires_grad]
 
         self.global_model.train()
+        self._freeze_bn()
         self.global_model.zero_grad()
 
         # --- Step 1: Forward pass with graph retained ---
@@ -216,6 +231,23 @@ class Server:
 
         self.global_model.zero_grad()
         return hvp_flat
+
+    def update_bn_stats(self) -> None:
+        """Recompute BatchNorm running stats using the validation set.
+
+        Since BN running stats are not aggregated via FedAvg, we recalculate
+        them from the validation data after each aggregation round.
+        """
+        self.global_model.train()
+        # Reset all BN running stats
+        for module in self.global_model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                module.reset_running_stats()
+
+        with torch.no_grad():
+            for X, _ in self.val_loader:
+                X = X.to(self.device)
+                self.global_model(X)
 
     def evaluate(self, test_loader: DataLoader) -> Dict[str, float]:
         """Evaluate global model on validation and test sets.

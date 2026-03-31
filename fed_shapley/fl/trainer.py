@@ -195,6 +195,7 @@ class FLTrainer:
             if ct:
                 ct.start("aggregation")
             self.server.aggregate(client_updates, agg_weights)
+            self.server.update_bn_stats()
             if ct:
                 round_times["aggregation"] = ct.stop("aggregation")
 

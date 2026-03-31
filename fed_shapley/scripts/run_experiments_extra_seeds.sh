@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# run_experiments_extra_seeds.sh — Run additional seeds for all 3 experiments
+# Adds seeds (0, 7, 99, 314) to existing results (42, 123, 456)
+# Usage: cd fed_shapley && bash scripts/run_experiments_extra_seeds.sh [--exp 1|2|3] [--dry-run]
+
+set -euo pipefail
+
+SEEDS=(0 7 99 314)
+DRY_RUN=false
+RUN_EXP=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --exp) RUN_EXP="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
+
+COMMON="--dataset cifar10 --num_clients 5 --clients_per_round 5 --local_lr 0.01 --noisy_clients 4 --noise_type label_flip"
+
+run_count=0
+fail_count=0
+
+run_cmd() {
+    run_count=$((run_count + 1))
+    echo ""
+    echo "================================================================"
+    echo "  Run #${run_count}: $1"
+    echo "================================================================"
+    shift
+    if $DRY_RUN; then
+        echo "[DRY-RUN] $*"
+    else
+        if ! "$@"; then
+            fail_count=$((fail_count + 1))
+            echo "[WARN] Run #${run_count} failed, continuing..."
+        fi
+    fi
+}
+
+# =========================================================================
+# Experiment 1: Non-FL vs FL Shapley accuracy comparison
+# 2 configs x 4 seeds = 8 runs
+# =========================================================================
+run_exp1() {
+    echo ""
+    echo "******** EXPERIMENT 1 (extra seeds): Non-FL vs FL Shapley Accuracy ********"
+    for seed in "${SEEDS[@]}"; do
+        run_cmd "Exp1-A seed=${seed}" \
+            python main.py $COMMON \
+            --num_rounds 50 --local_epochs 5 --partition iid \
+            --run_exact_shapley --run_centralized \
+            --seed "$seed" --output_dir ../results/exp1
+
+        run_cmd "Exp1-B seed=${seed}" \
+            python main.py $COMMON \
+            --num_rounds 50 --local_epochs 5 --partition iid \
+            --run_exact_shapley --run_centralized \
+            --use_second_order \
+            --seed "$seed" --output_dir ../results/exp1
+    done
+}
+
+# =========================================================================
+# Experiment 2: Communication cost vs Shapley accuracy trade-off
+# 5 configs x 4 seeds = 20 runs
+# =========================================================================
+run_exp2() {
+    echo ""
+    echo "******** EXPERIMENT 2 (extra seeds): Communication vs Accuracy Trade-off ********"
+
+    ROUNDS=(10 25 50 125 250)
+    EPOCHS=(25 10  5   2   1)
+
+    for seed in "${SEEDS[@]}"; do
+        for i in "${!ROUNDS[@]}"; do
+            r="${ROUNDS[$i]}"
+            e="${EPOCHS[$i]}"
+            run_cmd "Exp2-C$((i+1)) r=${r} e=${e} seed=${seed}" \
+                python main.py $COMMON \
+                --num_rounds "$r" --local_epochs "$e" --partition iid \
+                --run_exact_shapley \
+                --seed "$seed" --output_dir ../results/exp2
+        done
+    done
+}
+
+# =========================================================================
+# Experiment 3: Non-IID level vs Shapley accuracy
+# 6 configs x 4 seeds = 24 runs
+# =========================================================================
+run_exp3() {
+    echo ""
+    echo "******** EXPERIMENT 3 (extra seeds): Non-IID Level vs Accuracy ********"
+
+    ALPHAS=(10.0 1.0 0.5 0.1 0.01)
+
+    for seed in "${SEEDS[@]}"; do
+        run_cmd "Exp3-D1 iid seed=${seed}" \
+            python main.py $COMMON \
+            --num_rounds 50 --local_epochs 5 --partition iid \
+            --run_exact_shapley \
+            --seed "$seed" --output_dir ../results/exp3
+
+        idx=2
+        for alpha in "${ALPHAS[@]}"; do
+            run_cmd "Exp3-D${idx} alpha=${alpha} seed=${seed}" \
+                python main.py $COMMON \
+                --num_rounds 50 --local_epochs 5 \
+                --partition dirichlet --dirichlet_alpha "$alpha" \
+                --run_exact_shapley \
+                --seed "$seed" --output_dir ../results/exp3
+            idx=$((idx + 1))
+        done
+    done
+}
+
+# =========================================================================
+# Main
+# =========================================================================
+start_time=$(date +%s)
+echo "Starting extra-seed experiments at $(date)"
+echo "Seeds: ${SEEDS[*]}"
+
+if [[ -z "$RUN_EXP" || "$RUN_EXP" == "1" ]]; then run_exp1; fi
+if [[ -z "$RUN_EXP" || "$RUN_EXP" == "2" ]]; then run_exp2; fi
+if [[ -z "$RUN_EXP" || "$RUN_EXP" == "3" ]]; then run_exp3; fi
+
+end_time=$(date +%s)
+elapsed=$(( end_time - start_time ))
+echo ""
+echo "================================================================"
+echo "  All done! ${run_count} runs completed (${fail_count} failures)"
+echo "  Elapsed: $(( elapsed / 3600 ))h $(( (elapsed % 3600) / 60 ))m $(( elapsed % 60 ))s"
+echo "================================================================"

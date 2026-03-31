@@ -1,3 +1,11 @@
+<style>
+    body {
+        color: #CDD3DE !important;
+    }
+    pre, code {
+        color: #CDD3DE !important;
+    }
+</style>
 # FedLLM_CE
 
 **Federated Learning 환경에서 In-Run Data Shapley를 활용한 클라이언트 기여도 평가 프레임워크**
@@ -14,10 +22,12 @@ ICLR 2025 Outstanding Paper Runner-up ["Data Shapley in One Training Run"](https
 4. [빠른 시작](#빠른-시작)
 5. [상세 사용법](#상세-사용법)
 6. [모듈별 상세 설명](#모듈별-상세-설명)
-7. [실험 스크립트](#실험-스크립트)
-8. [출력 결과 해석](#출력-결과-해석)
-9. [전체 인자(Arguments) 목록](#전체-인자arguments-목록)
-10. [수학적 배경](#수학적-배경)
+7. [비용 추적 (시간 및 FLOPs)](#비용-추적-시간-및-flops)
+8. [실험 스크립트](#실험-스크립트)
+9. [실험 결과 요약](#실험-결과-요약)
+10. [출력 결과 해석](#출력-결과-해석)
+11. [전체 인자(Arguments) 목록](#전체-인자arguments-목록)
+12. [수학적 배경](#수학적-배경)
 
 ---
 
@@ -98,10 +108,13 @@ FedLLM_CE/
     ├── utils/                   # 유틸리티
     │   ├── __init__.py
     │   ├── seed.py              # 랜덤 시드 고정
-    │   ├── logger.py            # W&B, TensorBoard, 디스크 로깅
+    │   ├── logger.py            # W&B, TensorBoard, 디스크 로깅 (타이밍 CSV 포함)
+    │   ├── timer.py             # CostTracker — 벽시계 시간 및 FLOPs 추정
     │   └── visualize.py         # 바 차트, 산점도, 히트맵 시각화
     │
     ├── scripts/                 # 실험 실행 스크립트
+    │   ├── run_experiments.sh   # [메인] 3개 실험 통합 실행 (39 runs)
+    │   ├── analyze_results.py   # 실험 결과 집계 및 분석 도구
     │   ├── run_basic.sh         # 기본 IID 실험
     │   ├── run_noniid.sh        # Non-IID alpha 스윕
     │   ├── run_k_sweep.sh       # 로컬 에폭 스윕
@@ -111,12 +124,18 @@ FedLLM_CE/
     │       ├── k_sweep.yaml     # 로컬 에폭 스윕
     │       └── noise_sweep.yaml # 노이즈 클라이언트 스윕
     │
-    ├── outputs/                 # 실험 결과 저장 디렉토리
+    ├── outputs/                 # 실험 결과 저장 디렉토리 (기본)
     │   ├── *.json               # 실험 메트릭 및 설정
-    │   ├── *.csv                # Shapley 값 기록
+    │   ├── *.csv                # Shapley 값 기록, 타이밍 기록
     │   └── figures/             # 시각화 이미지
     │
     └── data_cache/              # 다운로드된 데이터셋 캐시
+
+results/                         # 사전 실행된 실험 결과 (프로젝트 루트)
+├── exp1/                        # 실험 1: Non-FL vs FL Shapley 정확도
+├── exp2/                        # 실험 2: Communication cost vs accuracy
+├── exp3/                        # 실험 3: Non-IID level vs accuracy
+└── analysis/                    # 집계된 CSV 요약
 ```
 
 ---
@@ -495,6 +514,21 @@ $$\phi_c^{(\text{iter})} = \sum_{z_i \in D_c} -\eta \cdot \langle \nabla \ell(w,
 
 `IndexedDataset` 래퍼를 사용하여 DataLoader에서 글로벌 인덱스를 추적합니다.
 
+### `utils/timer.py` — 비용 추적 (CostTracker)
+
+학습의 각 단계(phase)별 벽시계 시간과 FLOPs를 추적합니다:
+
+- **`start(name)` / `stop(name)`**: 특정 phase의 시간 측정 (CUDA synchronize 포함)
+- **`track(name)`**: context manager 방식 (`with cost_tracker.track("phase"):`)
+- **`estimate_model_flops(model, input_shape)`**: PyTorch `FlopCounterMode`로 forward pass당 FLOPs 추정. PyTorch < 2.1 fallback: `2 × total_params`
+- **`add_forward_passes(name, count)`**: phase별 forward pass 횟수 기록
+- **`get_summary()`**: 전체 비용 요약 dict 반환 (results.json에 포함됨)
+- **`print_summary()`**: 포맷된 비용 보고서 콘솔 출력
+
+**추적되는 phase들**: `local_training`, `shapley_computation`, `aggregation`, `evaluation`, `fl_training_total`, `gt_shapley`, `centralized_training`
+
+**FLOPs 추정 공식**: `총 FLOPs = forward_passes × flops_per_forward × 3` (backward ≈ 2× forward)
+
 ### `utils/logger.py` — 실험 로깅
 
 세 가지 백엔드를 동시에 지원합니다:
@@ -503,7 +537,9 @@ $$\phi_c^{(\text{iter})} = \sum_{z_i \in D_c} -\eta \cdot \langle \nabla \ell(w,
 2. **Weights & Biases** (`--use_wandb`): 실시간 메트릭 대시보드
 3. **TensorBoard** (`--use_tensorboard`): 텐서보드 대시보드
 
-실험 태그 자동 생성 예시: `cifar10_c10_k10_iid_r100_e5_lr0.01_s42`
+추가 기능:
+- **라운드별 타이밍 CSV 저장**: `{tag}_timing_rounds.csv` — 각 라운드의 `local_training`, `shapley_computation`, `aggregation`, `evaluation` 시간
+- 실험 태그 자동 생성 예시: `cifar10_c5_k5_iid_r50_e5_lr0.01_noisy4_s42`
 
 ### `utils/visualize.py` — 시각화
 
@@ -516,13 +552,84 @@ $$\phi_c^{(\text{iter})} = \sum_{z_i \in D_c} -\eta \cdot \langle \nabla \ell(w,
 
 ---
 
+## 비용 추적 (시간 및 FLOPs)
+
+학습과 기여도 계산의 비용을 정량적으로 파악하기 위해, 모든 실험에서 자동으로 벽시계 시간과 FLOPs를 기록합니다.
+
+### 자동 추적 항목
+
+| Phase | 설명 | 비고 |
+|-------|------|------|
+| `local_training` | 클라이언트 로컬 SGD 학습 시간 | 전체 라운드 합산 |
+| `shapley_computation` | In-Run Shapley 계산 시간 | val gradient + dot product |
+| `aggregation` | FedAvg 집계 시간 | 일반적으로 매우 짧음 |
+| `evaluation` | 검증/테스트 평가 시간 | `--eval_every` 주기 |
+| `fl_training_total` | FL 학습 전체 시간 | 위 4개의 상위 합계 |
+| `gt_shapley` | Ground-truth Shapley 계산 시간 | `--run_exact_shapley` 시 |
+| `centralized_training` | 중앙집중 학습 시간 | `--run_centralized` 시 |
+
+### 출력 예시
+
+```
+============================================================
+  Cost Summary (Wall-Clock Time & Estimated FLOPs)
+============================================================
+  [Time]
+    fl_training_total             :    3612.0s total
+    local_training                :    3509.0s total (70.2s avg × 50 calls)
+    shapley_computation           :      10.5s total (0.21s avg × 50 calls)
+    gt_shapley                    :      77.6s total
+    centralized_training          :   12071.0s total
+
+  [FLOPs]
+    Per forward pass: 1.11 GFLOPs
+    local_training                :  193750 fwd passes -> 645.68 TFLOPs
+    shapley_computation           :     400 fwd passes -> 1.33 TFLOPs
+============================================================
+```
+
+### Shapley Overhead
+
+Shapley 계산의 오버헤드는 전체 학습 시간 대비 **0.1%~1.5%** 수준으로, 실질적으로 무시할 수 있습니다:
+
+| 설정 | Shapley Overhead |
+|------|-----------------|
+| 1st order, 50 rounds | ~0.3% |
+| 2nd order, 50 rounds | ~1.0% |
+| 250 rounds | ~1.5% |
+
+---
+
 ## 실험 스크립트
 
-### 사전 정의된 실험
+### 메인 실험 스위트 (3개 실험, 39 runs)
 
 ```bash
 cd fed_shapley
 
+# 전체 실험 실행 (39 runs, GPU 기준 ~61시간)
+bash scripts/run_experiments.sh
+
+# 개별 실험만 실행
+bash scripts/run_experiments.sh --exp 1    # Exp1: Non-FL vs FL (6 runs)
+bash scripts/run_experiments.sh --exp 2    # Exp2: Communication trade-off (15 runs)
+bash scripts/run_experiments.sh --exp 3    # Exp3: Non-IID sweep (18 runs)
+
+# 명령어만 확인 (실행하지 않음)
+bash scripts/run_experiments.sh --dry-run
+```
+
+### 결과 분석
+
+```bash
+# 전체 실험 결과 집계 및 요약 테이블 출력
+python scripts/analyze_results.py --results_root ../results
+# → results/analysis/exp{1,2,3}_summary.csv 생성
+```
+
+### 기타 실험 스크립트
+
+```bash
 # 기본 IID 실험 (10 클라이언트, 100 라운드, ~30분 GPU)
 bash scripts/run_basic.sh
 
@@ -551,6 +658,67 @@ python scripts/run_grid_search.py --config scripts/grid_configs/k_sweep.yaml --d
 python scripts/run_grid_search.py --config scripts/grid_configs/alpha_sweep.yaml --max_runs 3
 ```
 
+---
+
+## 실험 결과 요약
+
+CIFAR-10, 5 클라이언트 환경에서 수행된 3가지 실험의 결과입니다. 모든 실험에서 클라이언트 4에 label_flip 노이즈를 주입하고, Exact Shapley를 ground-truth로 사용했습니다. 각 설정은 3개의 seed (42, 123, 456)로 반복 실행되었습니다.
+
+### 실험 1: Non-FL vs FL Shapley 정확도 비교
+
+FL In-Run Shapley와 Centralized(비-FL) 방식의 기여도 평가 정확도를 Exact Shapley 대비 비교합니다.
+
+| 방법 | Spearman $\rho$ | Pearson $r$ | AUROC | FL 시간 | 비고 |
+|------|----------------|-------------|-------|---------|------|
+| FL In-Run (1st order) | $0.60 \pm 0.36$ | $0.91 \pm 0.08$ | $1.0$ | ~3,606s | 기본 방법 |
+| FL In-Run (2nd order) | $0.53 \pm 0.39$ | $0.84 \pm 0.08$ | $1.0$ | ~3,632s | Hessian 보정 |
+| Centralized | $-0.30 \pm 0.28$ | $-0.31 \pm 0.26$ | - | ~12,012s | 비-FL baseline |
+
+**핵심 발견**:
+- FL In-Run이 Centralized보다 ranking 정확도가 높음 ($\rho$ 0.6 vs -0.3)
+- FL이 Centralized보다 **3.3배 빠름** (~1시간 vs ~3.3시간)
+- 2nd order Hessian 보정은 이 설정에서 유의한 개선을 보이지 않음
+- **노이즈 클라이언트 탐지는 모든 경우 AUROC 1.0** (완벽한 탐지)
+
+### 실험 2: Communication Cost vs Accuracy Trade-off
+
+총 computation budget를 $\text{rounds} \times \text{epochs} = 250$으로 고정하고, round를 촘촘하게 나눌수록 Shapley 정확도가 어떻게 변하는지 측정합니다.
+
+| Rounds | Epochs | Budget | Spearman $\rho$ | AUROC | Shapley OH% | 총 시간 |
+|--------|--------|--------|----------------|-------|-------------|---------|
+| 10 | 25 | 250 | $0.33 \pm 0.05$ | $1.0$ | 0.06% | ~3,541s |
+| **25** | **10** | **250** | $\mathbf{0.63 \pm 0.09}$ | $\mathbf{1.0}$ | **0.15%** | **~3,543s** |
+| 50 | 5 | 250 | $0.60 \pm 0.36$ | $1.0$ | 0.30% | ~3,609s |
+| **125** | **2** | **250** | $\mathbf{0.63 \pm 0.25}$ | $\mathbf{1.0}$ | **0.76%** | **~3,767s** |
+| 250 | 1 | 250 | $0.57 \pm 0.19$ | $1.0$ | 1.50% | ~4,045s |
+
+**핵심 발견**:
+- **Rounds 25~125이 최적 trade-off** ($\rho \approx 0.63$)
+- 너무 적은 rounds (10): Shapley 갱신 빈도 부족으로 정확도 하락
+- 너무 많은 rounds (250): 짧은 local training으로 업데이트 신호 약화
+- Shapley overhead는 최대 1.5%로 실질적으로 무시 가능
+- 총 시간은 모든 설정에서 유사 (동일 computation budget)
+
+### 실험 3: Non-IID 수준 vs Shapley 정확도
+
+Dirichlet $\alpha$를 변화시켜 데이터 이질성이 기여도 평가 정확도에 미치는 영향을 측정합니다.
+
+| 파티션 | $\alpha$ | Non-IID 수준 | Spearman $\rho$ | AUROC | Test Acc |
+|--------|---------|------------|----------------|-------|----------|
+| IID | - | 기준 (균일) | $0.60 \pm 0.36$ | $1.0$ | $0.219$ |
+| Dirichlet | 10.0 | 약함 | $0.50 \pm 0.28$ | $1.0$ | $0.218$ |
+| Dirichlet | 1.0 | 중간 | $0.33 \pm 0.40$ | $1.0$ | $0.210$ |
+| Dirichlet | 0.5 | 강함 | $0.57 \pm 0.12$ | $1.0$ | $0.244$ |
+| Dirichlet | **0.1** | **매우 강함** | $\mathbf{-0.23 \pm 0.17}$ | $1.0$ | $0.192$ |
+| Dirichlet | 0.01 | 극단적 | $0.47 \pm 0.26$ | $0.92$ | $0.135$ |
+
+**핵심 발견**:
+- IID ~ 약한 non-IID ($\alpha \geq 0.5$)에서 양호한 ranking 상관 ($\rho \approx 0.5\text{--}0.6$)
+- **매우 강한 non-IID ($\alpha = 0.1$)에서 Shapley ranking이 역전** ($\rho$ 음수) — gradient 방향의 이질성이 dot-product 기반 추정을 교란
+- 극단적 non-IID ($\alpha = 0.01$)에서 AUROC도 0.92로 하락 — 노이즈 탐지 성능 저하 시작
+
+---
+
 **YAML 설정 파일 형식** (`grid_configs/alpha_sweep.yaml` 예시):
 
 ```yaml
@@ -577,18 +745,21 @@ grid:
 
 ### 출력 파일 구조
 
-모든 결과는 `./outputs/` 디렉토리에 실험 태그 접두사와 함께 저장됩니다:
+모든 결과는 `--output_dir` 디렉토리에 실험 태그 접두사와 함께 저장됩니다:
 
 ```
-outputs/
-├── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_results.json     # 전체 실험 결과
-├── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_shapley.csv      # 누적 Shapley 값
-├── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_shapley_rounds.csv  # 라운드별 Shapley 값
+{output_dir}/
+├── {tag}_results.json           # 전체 실험 결과 (config, metrics, cost_summary 포함)
+├── {tag}_shapley.csv            # 누적 Shapley 값
+├── {tag}_shapley_rounds.csv     # 라운드별 Shapley 값
+├── {tag}_timing_rounds.csv      # 라운드별 시간 측정 (local_training, shapley, ...)
 └── figures/
-    ├── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_shapley_bar.png
-    ├── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_fidelity_scatter.png
-    └── cifar10_c10_k10_iid_r100_e5_lr0.01_s42_partition_heatmap.png
+    ├── {tag}_shapley_bar.png
+    ├── {tag}_fidelity_scatter.png
+    └── {tag}_partition_heatmap.png
 ```
+
+태그 예시: `cifar10_c5_k5_iid_r50_e5_lr0.01_noisy4_s42`
 
 ### Shapley 값 해석
 
@@ -602,17 +773,24 @@ outputs/
 
 ```json
 {
-  "experiment_tag": "cifar10_c10_k10_iid_r100_e5_lr0.01_s42",
-  "config": { ... },          // 전체 실험 설정
-  "round_logs": [             // 라운드별 메트릭
-    {"round": 5, "val_loss": 1.8, "val_acc": 0.35, "test_loss": 1.9, "test_acc": 0.33},
+  "experiment_tag": "cifar10_c5_k5_iid_r50_e5_lr0.01_noisy4_s42",
+  "config": { ... },                // 전체 실험 설정
+  "round_logs": [                   // 라운드별 메트릭
+    {"round": 1, "val_loss": 1.8, "val_acc": 0.35, "test_loss": 1.9, "test_acc": 0.33},
     ...
   ],
-  "final_summary": {          // 최종 요약 메트릭
-    "final_val_acc": 0.72,
-    "final_test_acc": 0.70,
-    "fidelity_spearman_r": 0.93,
-    "detection/auroc": 0.98
+  "final_summary": {                // 최종 요약 메트릭
+    "final_val_acc": 0.87,
+    "final_test_acc": 0.86,
+    "fidelity_spearman_r": 0.90,
+    "fidelity_pearson_r": 0.97,
+    "detection/auroc": 1.0,
+    "detection/precision_at_k": 1.0,
+    "time/fl_training_total_total_sec": 3612.0,
+    "time/local_training_total_sec": 3509.0,
+    "time/shapley_computation_total_sec": 10.5,
+    "flops/local_training_estimated_total_flops": 645680000000,
+    ...
   }
 }
 ```

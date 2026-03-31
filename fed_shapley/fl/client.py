@@ -136,6 +136,7 @@ class Client:
                 logits = self._model(X)
                 loss = self._criterion(logits, y)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._model.parameters(), max_norm=10.0)
                 optimizer.step()
 
         # Step 5: Compute Δw_c = w_local - w_global
