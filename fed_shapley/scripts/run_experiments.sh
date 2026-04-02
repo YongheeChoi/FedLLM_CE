@@ -21,7 +21,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Common flags
-COMMON="--dataset cifar10 --num_clients 5 --clients_per_round 5 --local_lr 0.01 --noisy_clients 4 --noise_type label_flip"
+COMMON="--dataset cifar10 --num_clients 5 --clients_per_round 5 --local_lr 0.01"
+NOISY="--noisy_clients 4 --noise_type label_flip"
 
 run_count=0
 fail_count=0
@@ -53,14 +54,14 @@ run_exp1() {
     for seed in "${SEEDS[@]}"; do
         # Config A: FL 1st order
         run_cmd "Exp1-A seed=${seed}" \
-            python main.py $COMMON \
+            python main.py $COMMON $NOISY \
             --num_rounds 50 --local_epochs 5 --partition iid \
             --run_exact_shapley --run_centralized \
             --seed "$seed" --output_dir ../results/exp1
 
         # Config B: FL 2nd order
         run_cmd "Exp1-B seed=${seed}" \
-            python main.py $COMMON \
+            python main.py $COMMON $NOISY \
             --num_rounds 50 --local_epochs 5 --partition iid \
             --run_exact_shapley --run_centralized \
             --use_second_order \
@@ -85,7 +86,7 @@ run_exp2() {
             r="${ROUNDS[$i]}"
             e="${EPOCHS[$i]}"
             run_cmd "Exp2-C$((i+1)) r=${r} e=${e} seed=${seed}" \
-                python main.py $COMMON \
+                python main.py $COMMON $NOISY \
                 --num_rounds "$r" --local_epochs "$e" --partition iid \
                 --run_exact_shapley \
                 --seed "$seed" --output_dir ../results/exp2

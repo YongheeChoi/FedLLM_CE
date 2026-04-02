@@ -151,7 +151,7 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--noise_ratio", type=float, default=0.5,
-        help="Fraction of data affected by noise (currently informational)."
+        help="Fraction of samples per batch affected by label flip noise."
     )
     parser.add_argument(
         "--run_centralized", action="store_true", default=False,
@@ -166,8 +166,12 @@ def get_args() -> argparse.Namespace:
     # Logging
     # -------------------------------------------------------------------------
     parser.add_argument(
-        "--use_wandb", action="store_true", default=False,
-        help="Enable Weights & Biases logging."
+        "--use_wandb", default=True, action="store_true",
+        help="Enable Weights & Biases logging (default: True)."
+    )
+    parser.add_argument(
+        "--no_wandb", dest="use_wandb", action="store_false",
+        help="Disable Weights & Biases logging."
     )
     parser.add_argument(
         "--wandb_project", type=str, default="fed_shapley",

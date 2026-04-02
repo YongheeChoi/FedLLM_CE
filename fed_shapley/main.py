@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Subset
 # ---- Project imports --------------------------------------------------------
 from config import get_args
 from utils.seed import set_seed
-from utils.logger import ExperimentLogger
+from utils.logger import ExperimentLogger, make_experiment_tag
 from utils.timer import CostTracker
 from utils.visualize import (
     plot_shapley_bar,
@@ -73,6 +73,14 @@ def main():
     # Create output directory (single shared folder for all experiments)
     exp_output_dir = args.output_dir
     os.makedirs(exp_output_dir, exist_ok=True)
+
+    # Check if experiment already completed (skip if results file exists)
+    tag = make_experiment_tag(args)
+    results_file = os.path.join(exp_output_dir, f"{tag}_results.json")
+    if os.path.exists(results_file):
+        print(f"[Main] Experiment already completed: {results_file}")
+        print(f"[Main] Skipping. Delete the file to re-run.")
+        return None
 
     print(f"\n{'='*60}")
     print(f"  FedShapley Experiment: {args.exp_name}")
@@ -259,52 +267,63 @@ def main():
     gt_shapley_values: Optional[Dict[int, float]] = None
 
     if ground_truth_shapley is not None:
-        print(f"\n[Main] Computing ground-truth Shapley values ...")
-        cost_tracker.start("gt_shapley")
-        # Run one pass of ground-truth Shapley using all client updates
-        # from the final round (approximation: use current model as w_T)
-        global_state = server.get_model_state()
-
-        # Collect updates from all clients for a final ground-truth pass
-        all_updates = []
-        all_ids = list(range(args.num_clients))
-        trainable_names = server.get_trainable_param_names()
-        from fl.trainer import _flatten_update_trainable
-        for cid in all_ids:
-            delta = clients[cid].local_train(global_state)
-            flat_delta = _flatten_update_trainable(delta, trainable_names)
-            all_updates.append(flat_delta)
-
-        if isinstance(ground_truth_shapley, ExactShapley):
-            gt_round = ground_truth_shapley.compute_round_exact_shapley(
-                client_updates=all_updates,
-                client_ids=all_ids,
-                eta=args.local_lr,
-                round_idx=0,
-            )
-            # ExactShapley: 2^n subsets, each needs val forward pass
-            n = args.num_clients
-            val_size = len(server.val_loader.dataset)
-            bs = args.local_batch_size
-            val_batches = (val_size + bs - 1) // bs
-            cost_tracker.add_forward_passes("gt_shapley", (2**n) * val_batches)
+        gt_cache_path = os.path.join(exp_output_dir, f"{tag}_exact_shapley.json")
+        if os.path.exists(gt_cache_path):
+            print(f"\n[Main] Loading cached ground-truth Shapley from {gt_cache_path}")
+            with open(gt_cache_path, "r") as f:
+                gt_shapley_values = {int(k): v for k, v in json.load(f).items()}
         else:
-            gt_round = ground_truth_shapley.compute_round_mc_shapley(
-                client_updates=all_updates,
-                client_ids=all_ids,
-                eta=args.local_lr,
-                round_idx=0,
-            )
-            # MC Shapley: T permutations × n positions, each needs val forward pass
-            val_size = len(server.val_loader.dataset)
-            bs = args.local_batch_size
-            val_batches = (val_size + bs - 1) // bs
-            cost_tracker.add_forward_passes(
-                "gt_shapley", args.mc_permutations * args.num_clients * val_batches
-            )
-        ground_truth_shapley.accumulate(gt_round)
-        gt_shapley_values = ground_truth_shapley.get_cumulative()
-        cost_tracker.stop("gt_shapley")
+            print(f"\n[Main] Computing ground-truth Shapley values ...")
+            cost_tracker.start("gt_shapley")
+            # Run one pass of ground-truth Shapley using all client updates
+            # from the final round (approximation: use current model as w_T)
+            global_state = server.get_model_state()
+
+            # Collect updates from all clients for a final ground-truth pass
+            all_updates = []
+            all_ids = list(range(args.num_clients))
+            trainable_names = server.get_trainable_param_names()
+            from fl.trainer import _flatten_update_trainable
+            for cid in all_ids:
+                delta = clients[cid].local_train(global_state)
+                flat_delta = _flatten_update_trainable(delta, trainable_names)
+                all_updates.append(flat_delta)
+
+            if isinstance(ground_truth_shapley, ExactShapley):
+                gt_round = ground_truth_shapley.compute_round_exact_shapley(
+                    client_updates=all_updates,
+                    client_ids=all_ids,
+                    eta=args.local_lr,
+                    round_idx=0,
+                )
+                # ExactShapley: 2^n subsets, each needs val forward pass
+                n = args.num_clients
+                val_size = len(server.val_loader.dataset)
+                bs = args.local_batch_size
+                val_batches = (val_size + bs - 1) // bs
+                cost_tracker.add_forward_passes("gt_shapley", (2**n) * val_batches)
+            else:
+                gt_round = ground_truth_shapley.compute_round_mc_shapley(
+                    client_updates=all_updates,
+                    client_ids=all_ids,
+                    eta=args.local_lr,
+                    round_idx=0,
+                )
+                # MC Shapley: T permutations × n positions, each needs val forward pass
+                val_size = len(server.val_loader.dataset)
+                bs = args.local_batch_size
+                val_batches = (val_size + bs - 1) // bs
+                cost_tracker.add_forward_passes(
+                    "gt_shapley", args.mc_permutations * args.num_clients * val_batches
+                )
+            ground_truth_shapley.accumulate(gt_round)
+            gt_shapley_values = ground_truth_shapley.get_cumulative()
+            cost_tracker.stop("gt_shapley")
+
+            # Cache to disk
+            with open(gt_cache_path, "w") as f:
+                json.dump({str(k): v for k, v in gt_shapley_values.items()}, f, indent=2)
+            print(f"[Main] Saved ground-truth Shapley to {gt_cache_path}")
 
         print("[Main] Ground-truth Shapley values:")
         for cid, sv in sorted(gt_shapley_values.items(), key=lambda x: x[1], reverse=True):
@@ -316,37 +335,48 @@ def main():
     centralized_shapley: Optional[Dict[int, float]] = None
 
     if args.run_centralized:
-        print("\n[Main] Running centralized training for baseline comparison ...")
-        cost_tracker.start("centralized_training")
-        # Create indexed dataset for sample → client attribution
-        indexed_train = IndexedDataset(Subset(train_dataset, train_indices_pool))
-        central_loader = DataLoader(
-            indexed_train,
-            batch_size=args.local_batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=(args.device == "cuda"),
-        )
-        fresh_model = get_model(args.model, num_classes, args.dataset)
-        central_trainer = CentralizedTrainer(
-            model=fresh_model,
-            train_loader=central_loader,
-            val_loader=val_loader,
-            client_data_indices=client_global_indices,
-            args=args,
-        )
-        centralized_shapley = central_trainer.train_and_compute_shapley()
-        cost_tracker.stop("centralized_training")
+        central_cache_path = os.path.join(exp_output_dir, f"{tag}_centralized_shapley.json")
+        if os.path.exists(central_cache_path):
+            print(f"\n[Main] Loading cached centralized Shapley from {central_cache_path}")
+            with open(central_cache_path, "r") as f:
+                centralized_shapley = {int(k): v for k, v in json.load(f).items()}
+        else:
+            print("\n[Main] Running centralized training for baseline comparison ...")
+            cost_tracker.start("centralized_training")
+            # Create indexed dataset for sample → client attribution
+            indexed_train = IndexedDataset(Subset(train_dataset, train_indices_pool))
+            central_loader = DataLoader(
+                indexed_train,
+                batch_size=args.local_batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=(args.device == "cuda"),
+            )
+            fresh_model = get_model(args.model, num_classes, args.dataset)
+            central_trainer = CentralizedTrainer(
+                model=fresh_model,
+                train_loader=central_loader,
+                val_loader=val_loader,
+                client_data_indices=client_global_indices,
+                args=args,
+            )
+            centralized_shapley = central_trainer.train_and_compute_shapley()
+            cost_tracker.stop("centralized_training")
 
-        # Estimate centralized FLOPs: per batch = val_grad + per-sample attribution + batch update
-        total_epochs = max(args.num_rounds * args.local_epochs // 10, 5)
-        pool_size = len(train_indices_pool)
-        bs = args.local_batch_size
-        batches_per_epoch = (pool_size + bs - 1) // bs
-        val_batches = (args.num_val_samples + bs - 1) // bs
-        # Each batch: val_grad(val_batches fwd) + B per-sample fwd + 1 batch fwd
-        total_central_fwd = total_epochs * batches_per_epoch * (val_batches + bs + 1)
-        cost_tracker.add_forward_passes("centralized_training", total_central_fwd)
+            # Estimate centralized FLOPs: per batch = val_grad + per-sample attribution + batch update
+            total_epochs = max(args.num_rounds * args.local_epochs // 10, 5)
+            pool_size = len(train_indices_pool)
+            bs = args.local_batch_size
+            batches_per_epoch = (pool_size + bs - 1) // bs
+            val_batches = (args.num_val_samples + bs - 1) // bs
+            # Each batch: val_grad(val_batches fwd) + B per-sample fwd + 1 batch fwd
+            total_central_fwd = total_epochs * batches_per_epoch * (val_batches + bs + 1)
+            cost_tracker.add_forward_passes("centralized_training", total_central_fwd)
+
+            # Cache to disk
+            with open(central_cache_path, "w") as f:
+                json.dump({str(k): v for k, v in centralized_shapley.items()}, f, indent=2)
+            print(f"[Main] Saved centralized Shapley to {central_cache_path}")
 
     # =========================================================================
     # 11. Fidelity evaluation

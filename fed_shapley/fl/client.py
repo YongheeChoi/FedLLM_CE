@@ -129,8 +129,12 @@ class Client:
                 # Step 4: Apply label flip noise if this client is noisy
                 if self.is_noisy and self.args.noise_type == "label_flip":
                     if self.num_classes is not None:
-                        # label → (num_classes - 1 - label): full label flip
-                        y = (self.num_classes - 1 - y).clamp(0, self.num_classes - 1)
+                        batch_size = y.size(0)
+                        noise_ratio = self.args.noise_ratio
+                        num_to_flip = int(batch_size * noise_ratio)
+                        if num_to_flip > 0:
+                            flip_indices = torch.randperm(batch_size, device=y.device)[:num_to_flip]
+                            y[flip_indices] = (self.num_classes - 1 - y[flip_indices]).clamp(0, self.num_classes - 1)
 
                 optimizer.zero_grad()
                 logits = self._model(X)
