@@ -1,3 +1,11 @@
+<style>
+    body {
+        color: #CDD3DE !important;
+    }
+    pre, code {
+        color: #CDD3DE !important;
+    }
+</style>
 ### 연합학습 기반 In-Run Data Shapley 계산 프로세스
 
 #### Step 1: 클라이언트의 로컬 학습 및 업데이트 전송

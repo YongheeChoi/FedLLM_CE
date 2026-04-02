@@ -1,3 +1,11 @@
+<style>
+    body {
+        color: #CDD3DE !important;
+    }
+    pre, code {
+        color: #CDD3DE !important;
+    }
+</style>
 # In-Run Data Shapley for Federated Learning: 코드 구현 요청 프롬프트
 
 ## 프로젝트 개요
