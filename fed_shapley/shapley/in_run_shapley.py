@@ -13,9 +13,37 @@ Reference: "Data Shapley in One Training Run" (ICLR 2025 Outstanding Paper Runne
 """
 
 import argparse
+import random
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
+
+
+class _RNGStateContext:
+    """Save and restore all RNG states (Python, NumPy, Torch CPU/CUDA).
+
+    Ensures that Shapley computation does not perturb the training random
+    stream, which would cause 1st-order vs 2nd-order runs to diverge.
+    """
+
+    def __enter__(self):
+        self._py = random.getstate()
+        self._np = np.random.get_state()
+        self._torch = torch.random.get_rng_state()
+        self._cuda = (
+            [torch.cuda.get_rng_state(i) for i in range(torch.cuda.device_count())]
+            if torch.cuda.is_available()
+            else []
+        )
+        return self
+
+    def __exit__(self, *exc):
+        random.setstate(self._py)
+        np.random.set_state(self._np)
+        torch.random.set_rng_state(self._torch)
+        for i, s in enumerate(self._cuda):
+            torch.cuda.set_rng_state(s, i)
 
 
 def flatten_state_dict(state_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -133,6 +161,19 @@ class InRunDataShapley:
         Returns:
             Dict[int, float]: {client_id: ϕ_c^(t)} for this round only.
         """
+        with _RNGStateContext():
+            return self._compute_round_shapley_impl(
+                client_updates, client_ids, eta, round_idx,
+            )
+
+    def _compute_round_shapley_impl(
+        self,
+        client_updates: List[torch.Tensor],
+        client_ids: List[int],
+        eta: float,
+        round_idx: int,
+    ) -> Dict[int, float]:
+        """Inner implementation of compute_round_shapley (RNG-isolated)."""
         device = self.server.device
 
         # Move all updates to computation device
