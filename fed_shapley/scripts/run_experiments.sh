@@ -1,24 +1,45 @@
 #!/usr/bin/env bash
-# run_experiments.sh — Run all 3 experiments (39 total runs)
-# Usage: cd fed_shapley && bash scripts/run_experiments.sh [--exp 1|2|3] [--dry-run]
+# run_experiments.sh — Run all 3 experiments
+# Usage: cd fed_shapley && bash scripts/run_experiments.sh [OPTIONS]
+#
+# Options:
+#   --exp 1|2|3           Run a single experiment
+#   --dry-run             Print commands without executing
+#   --seed_of_seed S      Meta-seed to deterministically generate experiment seeds (default: use fixed seeds 42 123 456)
+#   --num_seeds N         Number of seeds to generate from seed_of_seed (default: 3)
 #
 # Must be run from the fed_shapley/ directory.
-# Use --exp to run a single experiment. Use --dry-run to print commands without executing.
 
 set -euo pipefail
 
-SEEDS=(42 123 456)
 DRY_RUN=false
 RUN_EXP=""
+SEED_OF_SEED=""
+NUM_SEEDS=5
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --exp) RUN_EXP="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --seed_of_seed) SEED_OF_SEED="$2"; shift 2 ;;
+        --num_seeds) NUM_SEEDS="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# Generate seeds
+if [[ -n "$SEED_OF_SEED" ]]; then
+    SEEDS=($(python -c "
+import random
+random.seed($SEED_OF_SEED)
+print(' '.join(str(random.randint(0, 99999)) for _ in range($NUM_SEEDS)))
+"))
+    echo "Generated ${NUM_SEEDS} seeds from seed_of_seed=${SEED_OF_SEED}: ${SEEDS[*]}"
+else
+    SEEDS=(42 123 456)
+    echo "Using default seeds: ${SEEDS[*]}"
+fi
 
 # Common flags
 COMMON="--dataset cifar10 --num_clients 5 --clients_per_round 5 --local_lr 0.01"
